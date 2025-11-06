@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "queuectl"
+version = "0.1.0"
+description = "queuectl - simple job queue CLI + daemon"
+requires-python = ">=3.8"
+
+[project.scripts]
+queuectl = "queuectl_client.cli:app"
+
+[tool.setuptools.packages.find]
+# explicitly include only these top-level packages
+include = ["queuectl_client", "daemon", "worker"]
+
+
