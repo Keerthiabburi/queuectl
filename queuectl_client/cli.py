@@ -28,8 +28,7 @@ def enqueue(payload: str):
     r = requests.post(f"{DAEMON}/enqueue", json=data, timeout=5)
     try:
         r.raise_for_status()
-    except requests.HTTPError as e:
-        # surface 409 nicely
+    except requests.HTTPError:
         if r.status_code == 409:
             typer.echo(f"Conflict: {r.json().get('detail') if r.headers.get('content-type','').startswith('application/json') else r.text}")
             raise typer.Exit(code=1)
@@ -72,6 +71,12 @@ def cli_dlq_retry(job_id: str):
 @app.command("config-set")
 def cli_config_set(key: str, value: str):
     r = requests.post(f"{DAEMON}/config/set", json={"key": key, "value": value}, timeout=5)
+    r.raise_for_status()
+    typer.echo(r.json())
+
+@app.command("workers")
+def cli_workers():
+    r = requests.get(f"{DAEMON}/workers", timeout=5)
     r.raise_for_status()
     typer.echo(r.json())
 

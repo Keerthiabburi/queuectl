@@ -33,6 +33,7 @@ DEAD = os.getenv("QUEUECTL_DEAD_KEY", "jobs:dlq")
 DELAYED = os.getenv("QUEUECTL_DELAYED_KEY", "jobs:delayed")
 IDS_SET = os.getenv("QUEUECTL_IDS_SET", "jobs:ids")
 CONFIG_HASH = os.getenv("QUEUECTL_CONFIG_HASH", "queuectl:config")
+WORKERS_SET = os.getenv("QUEUECTL_WORKERS_SET", "workers:set")
 
 DELAYED_BATCH = int(os.getenv("QUEUECTL_DELAYED_MOVER_BATCH", "100"))
 DELAYED_INTERVAL = float(os.getenv("QUEUECTL_DELAYED_MOVER_INTERVAL", "1.0"))
@@ -41,13 +42,17 @@ DEFAULT_MAX_RETRIES = int(os.getenv("QUEUECTL_DEFAULT_MAX_RETRIES", "3"))
 DEFAULT_BACKOFF_BASE = int(os.getenv("QUEUECTL_DEFAULT_BACKOFF_BASE", "2"))
 MAX_BACKOFF_SECONDS = int(os.getenv("QUEUECTL_MAX_BACKOFF_SECONDS", "3600"))
 
+VISIBILITY_TIMEOUT = int(os.getenv("QUEUECTL_VISIBILITY_TIMEOUT", "30"))
+REAPER_INTERVAL = int(os.getenv("QUEUECTL_REAPER_INTERVAL", "5"))
+REAPER_BATCH = int(os.getenv("QUEUECTL_REAPER_BATCH", "100"))
+
 WORKER_MODULE = os.getenv("QUEUECTL_WORKER_MODULE", "worker.worker")
 
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=REDIS_DECODE)
 
 app = FastAPI()
-WORKERS = {}
+LOCAL_WORKERS = {}
 
 # Ensure defaults
 DEFAULT_CONFIG = {"max-retries": DEFAULT_MAX_RETRIES, "backoff_base": DEFAULT_BACKOFF_BASE}
@@ -68,6 +73,31 @@ def get_config_int(key: str, default: int):
 def set_config(key: str, value: str):
     r.hset(CONFIG_HASH, key, value)
 
+
+_ENQUEUE_LUA = """
+-- KEYS[1] = ids set
+-- KEYS[2] = queue list
+-- ARGV[1] = job_id
+-- ARGV[2] = job_json
+local added = redis.call('SADD', KEYS[1], ARGV[1])
+if added == 0 then
+  return 0
+end
+redis.call('LPUSH', KEYS[2], ARGV[2])
+return 1
+"""
+
+_REQUEUE_MEMBER_LUA = """
+-- KEYS[1] = processing_list
+-- KEYS[2] = queue_list
+-- ARGV[1] = member_value
+local removed = redis.call('lrem', KEYS[1], 1, ARGV[1])
+if removed > 0 then
+  return redis.call('lpush', KEYS[2], ARGV[1])
+end
+return 0
+"""
+
 class JobModel(BaseModel):
     id: str
     command: str
@@ -77,16 +107,8 @@ class JobModel(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
-@app.on_event("startup")
-def start_background_tasks():
-    t = threading.Thread(target=_delayed_mover, daemon=True)
-    t.start()
-    logger.info("Started delayed mover thread")
-
 def _delayed_mover():
-    """
-    Move ready jobs from DELAYED zset to QUEUE (pending).
-    """
+    """Move ready items from DELAYED zset back to QUEUE (pending)."""
     while True:
         try:
             now = time.time()
@@ -106,20 +128,49 @@ def _delayed_mover():
                 logger.info("Moved delayed job back to pending: %s", job.get("id"))
             time.sleep(DELAYED_INTERVAL)
         except Exception:
-            logger.exception("Delayed mover error; sleeping %s", DELAYED_INTERVAL)
+            logger.exception("Delayed mover error; sleeping")
             time.sleep(DELAYED_INTERVAL)
-_ENQUEUE_LUA = """
--- KEYS[1] = ids set
--- KEYS[2] = queue list
--- ARGV[1] = job_id
--- ARGV[2] = job_json
-local added = redis.call('SADD', KEYS[1], ARGV[1])
-if added == 0 then
-  return 0
-end
-redis.call('LPUSH', KEYS[2], ARGV[2])
-return 1
-"""
+
+def _reaper_loop():
+    """
+    Reclaim processing jobs whose lock expired: move them back to QUEUE.
+    """
+    while True:
+        try:
+            items = r.lrange(PROCESSING, 0, REAPER_BATCH - 1)
+            if not items:
+                time.sleep(REAPER_INTERVAL)
+                continue
+            for member in items:
+                try:
+                    job = json.loads(member)
+                    job_id = job.get("id")
+                except Exception:
+                    r.lrem(PROCESSING, 1, member)
+                    r.lpush(DEAD, member)
+                    continue
+                lock_key = f"lock:job:{job_id}"
+                if r.exists(lock_key):
+                    continue
+                try:
+                    moved = r.eval(_REQUEUE_MEMBER_LUA, 2, PROCESSING, QUEUE, member)
+                    if moved:
+                        logger.info("Requeued stale processing job %s back to pending", job_id)
+                except Exception:
+                    logger.exception("Reaper error moving job %s", job_id)
+            time.sleep(REAPER_INTERVAL)
+        except Exception:
+            logger.exception("Reaper loop error")
+            time.sleep(REAPER_INTERVAL)
+
+@app.on_event("startup")
+def startup_tasks():
+    t1 = threading.Thread(target=_delayed_mover, daemon=True)
+    t1.start()
+    logger.info("Started delayed mover")
+    t2 = threading.Thread(target=_reaper_loop, daemon=True)
+    t2.start()
+    logger.info("Started reaper loop")
 
 @app.post("/enqueue")
 def enqueue(job: JobModel):
@@ -131,9 +182,9 @@ def enqueue(job: JobModel):
         j["max_retries"] = get_config_int("max-retries", DEFAULT_CONFIG["max-retries"])
     j.setdefault("created_at", now)
     j["updated_at"] = now
-    job_json = json.dumps(j)
-    job_id = j["id"]
 
+    job_id = j["id"]
+    job_json = json.dumps(j)
     try:
         res = r.eval(_ENQUEUE_LUA, 2, IDS_SET, QUEUE, job_id, job_json)
     except Exception:
@@ -152,45 +203,81 @@ def worker_start(payload: dict):
         try:
             cmd = [sys.executable, "-m", WORKER_MODULE]
             p = subprocess.Popen(cmd)
-            WORKERS[p.pid] = p
+            LOCAL_WORKERS[p.pid] = p
             pids.append(p.pid)
-            logger.info("Started worker pid=%s", p.pid)
+            logger.info("Started local worker pid=%s", p.pid)
         except Exception:
-            logger.exception("Failed to start worker")
+            logger.exception("Failed to start worker subprocess")
     return {"started": pids}
 
 @app.post("/worker/stop")
 def worker_stop(payload: dict):
-    killed = []
-    for pid, p in list(WORKERS.items()):
+    
+    stopped = []
+    
+    for pid, p in list(LOCAL_WORKERS.items()):
         try:
             p.terminate()
-            killed.append(pid)
-            WORKERS.pop(pid, None)
+            stopped.append(pid)
+            LOCAL_WORKERS.pop(pid, None)
+            logger.info("Terminated local worker pid=%s", pid)
         except Exception:
-            logger.exception("Failed to terminate pid=%s", pid)
-    return {"stopped": killed}
+            logger.exception("Failed to terminate worker pid=%s", pid)
+
+    requeued = []
+    skipped_locked = 0
+
+    try:
+        items = r.lrange(PROCESSING, 0, -1)
+    except Exception:
+        logger.exception("Failed to read processing list")
+        items = []
+
+    for member in items:
+        try:
+            j = json.loads(member)
+            job_id = j.get("id")
+        except Exception:
+            try:
+                r.lrem(PROCESSING, 1, member)
+                r.lpush(DEAD, member)
+                logger.warning("Corrupt processing member moved to DLQ")
+            except Exception:
+                logger.exception("Failed to move corrupt member to DLQ")
+            continue
+
+        lock_key = f"lock:job:{job_id}"
+        try:
+            if r.exists(lock_key):
+                skipped_locked += 1
+                continue
+
+            moved = r.eval(_REQUEUE_MEMBER_LUA, 2, PROCESSING, QUEUE, member)
+            if moved:
+                requeued.append(job_id)
+                logger.info("Requeued processing job %s back to pending (stop)", job_id)
+            else:
+                logger.debug("Member %s was not moved (already removed?); skipping", job_id)
+        except Exception:
+            logger.exception("Error while attempting to requeue job %s", job_id)
+
+    return {"stopped": stopped, "requeued": requeued, "skipped_locked": skipped_locked}
+
 
 @app.get("/status")
 def status():
     try:
-        qlen = r.llen(QUEUE)
-        proc_len = r.llen(PROCESSING)
-        completed_len = r.llen(COMPLETED)
-        failed_len = r.llen(FAILED)
-        dlq_len = r.llen(DEAD)
-        delayed_len = r.zcard(DELAYED)
+        return {
+            "queue_pending": r.llen(QUEUE),
+            "processing": r.llen(PROCESSING),
+            "completed": r.llen(COMPLETED),
+            "failed": r.llen(FAILED),
+            "dead": r.llen(DEAD),
+            "delayed": r.zcard(DELAYED),
+            "workers_local": list(LOCAL_WORKERS.keys())
+        }
     except Exception:
-        qlen = proc_len = completed_len = failed_len = dlq_len = delayed_len = None
-    return {
-        "queue_pending": qlen,
-        "processing": proc_len,
-        "completed": completed_len,
-        "failed": failed_len,
-        "dead": dlq_len,
-        "delayed": delayed_len,
-        "workers": list(WORKERS.keys())
-    }
+        raise HTTPException(status_code=500, detail="redis error")
 
 @app.get("/list")
 def list_jobs(state: str = "pending"):
@@ -257,11 +344,32 @@ def dlq_retry(job_id: str):
     r.lpush(QUEUE, json.dumps(j))
     return {"status": "retried", "id": job_id}
 
-class ConfigSet(BaseModel):
-    key: str
-    value: str
-
 @app.post("/config/set")
-def config_set(payload: ConfigSet):
-    set_config(payload.key, payload.value)
-    return {"status": "ok", "key": payload.key, "value": payload.value}
+def config_set(payload: BaseModel):
+    body = payload.dict()
+    key = body.get("key")
+    value = body.get("value")
+    if not key:
+        raise HTTPException(status_code=400, detail="missing key")
+    set_config(key, value)
+    return {"status": "ok", "key": key, "value": value}
+
+@app.get("/workers")
+def list_workers():
+    ids = r.smembers(WORKERS_SET) or set()
+    out = []
+    for wid in ids:
+        meta = r.hgetall(f"workers:{wid}:meta") or {}
+        heartbeat = r.get(f"worker:heartbeat:{wid}")
+        meta["heartbeat"] = heartbeat
+        out.append(meta)
+    return {"count": len(out), "workers": out}
+
+@app.get("/health")
+def health():
+    # basic healthcheck: ping redis
+    try:
+        r.ping()
+        return {"status": "ok"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="redis unreachable")
