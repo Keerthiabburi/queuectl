@@ -343,15 +343,18 @@ def dlq_retry(job_id: str):
     j["updated_at"] = utcnow_iso_z()
     r.lpush(QUEUE, json.dumps(j))
     return {"status": "retried", "id": job_id}
+class ConfigPayload(BaseModel):
+    key: str
+    value: str
+
 
 @app.post("/config/set")
-def config_set(payload: BaseModel):
-    body = payload.dict()
-    key = body.get("key")
-    value = body.get("value")
+def config_set(payload: ConfigPayload):
+    key = payload.key
+    value = payload.value
     if not key:
         raise HTTPException(status_code=400, detail="missing key")
-    set_config(key, value)
+    r.hset(CONFIG_HASH, key, str(value))
     return {"status": "ok", "key": key, "value": value}
 
 @app.get("/workers")

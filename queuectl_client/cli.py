@@ -53,23 +53,26 @@ def cli_list(state: str = typer.Option("pending", "--state", "-s", help="pending
     r.raise_for_status()
     typer.echo(r.json())
 
-@app.command("dlq-list")
-def cli_dlq_list():
-    r = requests.get(f"{DAEMON}/dlq/list", timeout=5)
-    r.raise_for_status()
-    typer.echo(r.json())
+@app.command("dlq")
+def cli_dlq(action: str = typer.Argument(..., help="list or retry"),
+    job_id: str = typer.Argument(None, help="Job ID (required for retry)")):
 
-@app.command("dlq-retry")
-def cli_dlq_retry(job_id: str):
-    r = requests.post(f"{DAEMON}/dlq/retry/{job_id}", timeout=5)
-    if r.status_code == 404:
-        typer.echo(f"job {job_id} not found in DLQ")
-        raise typer.Exit(code=1)
-    r.raise_for_status()
-    typer.echo(r.json())
+    if action == "list":
+        r = requests.get(f"{DAEMON}/dlq/list", timeout=5)
+        r.raise_for_status()
+        typer.echo(r.json())
+    elif action == "retry":
+        r = requests.post(f"{DAEMON}/dlq/retry/{job_id}", timeout=5)
+        if r.status_code == 404:
+            typer.echo(f"job {job_id} not found in DLQ")
+            raise typer.Exit(code=1)
+        r.raise_for_status()
+        typer.echo(r.json())
+            
 
-@app.command("config-set")
-def cli_config_set(key: str, value: str):
+@app.command("config")
+def cli_config_set(action: str, key: str, value: str):
+    # queuectl config set max-retries 3
     r = requests.post(f"{DAEMON}/config/set", json={"key": key, "value": value}, timeout=5)
     r.raise_for_status()
     typer.echo(r.json())
