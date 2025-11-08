@@ -1,8 +1,9 @@
 # daemon/main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import redis, os, subprocess, json, sys, logging, threading, time
+import redis, subprocess, json, sys, logging, threading, time
 from typing import Optional
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +28,9 @@ for k, v in DEFAULT_CONFIG.items():
     if r.hget(CONFIG_HASH, k) is None:
         r.hset(CONFIG_HASH, k, v)
 
+def utcnow_iso_z():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def get_config_int(key: str, default: int):
     v = r.hget(CONFIG_HASH, key)
     try:
@@ -40,7 +44,11 @@ def set_config(key: str, value: str):
 class JobModel(BaseModel):
     id: str
     command: str
+    state: Optional[str] = "pending"
     attempts: Optional[int] = 0
+    max_retries: Optional[int] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
 @app.on_event("startup")
 def start_background_tasks():
@@ -54,22 +62,20 @@ def _delayed_mover():
     while True:
         try:
             now = time.time()
-            
             ready = r.zrangebyscore(DELAYED, "-inf", now, start=0, num=100)
-            if ready:
-                for member in ready:
-                    
-                    with r.pipeline() as pipe:
-                        pipe.multi()
-                        pipe.zrem(DELAYED, member)
-                        pipe.execute()
-                        
-                    removed = r.zrem(DELAYED, member) 
-                    if removed:
-                        
-                        r.lpush(QUEUE, member)
-                        logger.info("Moved delayed job back to pending: %s", member)
-            
+            for member in ready:
+                removed = r.zrem(DELAYED, member)
+                if removed:
+                    try:
+                        job = json.loads(member)
+                    except Exception:
+                       
+                        r.lpush(DEAD, member)
+                        continue
+                    job["state"] = "pending"
+                    job["updated_at"] = utcnow_iso_z()
+                    r.lpush(QUEUE, json.dumps(job))
+                    logger.info("Moved delayed job back to pending: %s", job.get("id"))
             time.sleep(1.0)
         except Exception:
             logger.exception("Delayed mover encountered an error; retrying in 1s")
@@ -77,11 +83,17 @@ def _delayed_mover():
 
 @app.post("/enqueue")
 def enqueue(job: JobModel):
+    now = utcnow_iso_z()
     j = job.dict()
+    j.setdefault("state", "pending")
     j.setdefault("attempts", 0)
+    if j.get("max_retries") is None:
+        j["max_retries"] = get_config_int("max-retries", DEFAULT_CONFIG["max-retries"])
+    j.setdefault("created_at", now)
+    j["updated_at"] = now
     job_json = json.dumps(j)
     r.lpush(QUEUE, job_json)
-    return {"status": "ok", "id": job.id}
+    return {"status": "ok", "id": j["id"]}
 
 @app.post("/worker/start")
 def worker_start(payload: dict):
@@ -193,7 +205,8 @@ def dlq_retry(job_id: str):
         raise HTTPException(status_code=404, detail="job not found in DLQ")
     r.lrem(DEAD, 1, target)
     j = json.loads(target)
-    j["attempts"] = j.get("attempts", 0)
+    j["state"] = "pending"
+    j["updated_at"] = utcnow_iso_z()
     r.lpush(QUEUE, json.dumps(j))
     return {"status": "retried", "id": job_id}
 

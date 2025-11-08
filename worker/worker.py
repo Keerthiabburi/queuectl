@@ -1,6 +1,7 @@
 import redis, json, subprocess, time, os
 import sys, logging
 import math
+from datetime import datetime, timezone
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,6 +15,9 @@ FAILED = "jobs:failed"
 DEAD = "jobs:dlq"
 DELAYED = "jobs:delayed"
 CONFIG_HASH = "queuectl:config"
+
+def utcnow_iso_z():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def get_max_retries():
     v = r.hget(CONFIG_HASH, "max-retries")
@@ -39,28 +43,45 @@ def execute(job):
         logger.exception("Job failed %s: %s", job.get("id"), e)
         return False
 
-def push_to_dead(job):
-    logger.info("Pushing job to DEAD/DLQ %s", job.get("id"))
-    r.lpush(DEAD, json.dumps(job))
-
-def record_failed(job):
-    logger.info("Recording failed job %s attempts=%s", job.get("id"), job.get("attempts"))
-    r.lpush(FAILED, json.dumps(job))
+def mark_processing_replace(raw, job):
+    """Replace the raw entry in PROCESSING with updated job JSON."""
+    try:
+        r.lrem(PROCESSING, 1, raw)
+        r.lpush(PROCESSING, json.dumps(job))
+    except Exception:
+        logger.exception("Failed to replace processing entry for %s", job.get("id"))
 
 def mark_completed(job):
-    logger.info("Marking job completed %s", job.get("id"))
+    job["state"] = "completed"
+    job["updated_at"] = utcnow_iso_z()
     r.lpush(COMPLETED, json.dumps(job))
+    logger.info("Marked completed %s", job.get("id"))
+
+def record_failed(job):
+    job["state"] = "failed"
+    job["updated_at"] = utcnow_iso_z()
+    r.lpush(FAILED, json.dumps(job))
+    logger.info("Recorded failed %s attempts=%s", job.get("id"), job.get("attempts"))
+
+def push_to_dead(job):
+    job["state"] = "dead"
+    job["updated_at"] = utcnow_iso_z()
+    r.lpush(DEAD, json.dumps(job))
+    logger.info("Pushed to DLQ %s", job.get("id"))
 
 def schedule_delayed(job, delay_seconds):
-    
     available_at = time.time() + delay_seconds
+    job["state"] = "delayed"
+    job["updated_at"] = utcnow_iso_z()
     member = json.dumps(job)
     r.zadd(DELAYED, {member: available_at})
-    logger.info("Scheduled job %s to run in %s sec (at %s)", job.get("id"), delay_seconds, available_at)
+    logger.info("Scheduled delayed job %s for in %s sec", job.get("id"), delay_seconds)
 
-def requeue_job_immediate(job):
-    logger.info("Requeueing job immediately %s attempts=%s", job.get("id"), job.get("attempts"))
+def requeue_immediate(job):
+    job["state"] = "pending"
+    job["updated_at"] = utcnow_iso_z()
     r.lpush(QUEUE, json.dumps(job))
+    logger.info("Requeued job immediate %s", job.get("id"))
 
 if __name__ == "__main__":
     while True:
@@ -77,30 +98,32 @@ if __name__ == "__main__":
             r.lpush(DEAD, raw)
             continue
 
+        # update to processing state and replace the entry in PROCESSING with updated job json
+        job["state"] = "processing"
+        job["updated_at"] = utcnow_iso_z()
+        mark_processing_replace(raw, job)
+
         attempts = int(job.get("attempts", 0))
         # execute
         ok = execute(job)
-        # remove from processing
-        r.lrem(PROCESSING, 1, raw)
+
+        # remove current job entry from processing (attempt to remove the updated JSON)
+        current_serialized = json.dumps(job)
+        r.lrem(PROCESSING, 1, current_serialized)
 
         if ok:
-            # success
             mark_completed(job)
             continue
 
         # failure handling
-        max_retries = get_max_retries()
+        max_retries = job.get("max_retries") if job.get("max_retries") is not None else get_max_retries()
         base = get_backoff_base()
-        new_attempts = attempts + 1
-        job["attempts"] = new_attempts
+        job["attempts"] = attempts + 1
 
-        if new_attempts <= max_retries:
-            # schedule with exponential backoff: delay = base ** attempts
-            try:
-                delay_seconds = int(math.pow(base, new_attempts))
-            except Exception:
-                delay_seconds = base ** new_attempts
+        if job["attempts"] <= int(max_retries):
             record_failed(job)
+            # exponential backoff: delay = base ** attempts
+            delay_seconds = int(math.pow(base, job["attempts"]))
             schedule_delayed(job, delay_seconds)
         else:
             # exceeded retries -> send to dead-letter queue
