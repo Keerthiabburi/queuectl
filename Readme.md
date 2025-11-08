@@ -1,5 +1,7 @@
 # queuectl — Distributed Job Queue with Workers, Backoff & DLQ
 
+**📹 Demo Video:** [Watch on Google Drive](https://drive.google.com/file/d/1AipUjS91-B4sM-jI9OAXbtFlEPGRSzUh/view?usp=sharing)
+
 `queuectl` is a lightweight job queue and worker system built using **Python**, **Redis**, **FastAPI**, and **Typer**.
 
 ## Features
