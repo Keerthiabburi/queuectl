@@ -1,20 +1,37 @@
-import redis, json, subprocess, time, os
-import sys, logging
+import os
+import json
+import time
 import math
+import logging
+import subprocess
 from datetime import datetime, timezone
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import redis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+REDIS_HOST = os.getenv("QUEUECTL_REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("QUEUECTL_REDIS_PORT", "6379"))
+REDIS_DECODE = os.getenv("QUEUECTL_REDIS_DECODE_RESPONSES", "true").lower() in ("1","true","yes")
 
-QUEUE = "jobs"
-PROCESSING = "jobs:processing"
-COMPLETED = "jobs:completed"
-FAILED = "jobs:failed"
-DEAD = "jobs:dlq"
-DELAYED = "jobs:delayed"
-CONFIG_HASH = "queuectl:config"
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=REDIS_DECODE)
+
+QUEUE = os.getenv("QUEUECTL_QUEUE_KEY", "jobs")
+PROCESSING = os.getenv("QUEUECTL_PROCESSING_KEY", "jobs:processing")
+COMPLETED = os.getenv("QUEUECTL_COMPLETED_KEY", "jobs:completed")
+FAILED = os.getenv("QUEUECTL_FAILED_KEY", "jobs:failed")
+DEAD = os.getenv("QUEUECTL_DEAD_KEY", "jobs:dlq")
+DELAYED = os.getenv("QUEUECTL_DELAYED_KEY", "jobs:delayed")
+CONFIG_HASH = os.getenv("QUEUECTL_CONFIG_HASH", "queuectl:config")
+
+MAX_BACKOFF_SECONDS = int(os.getenv("QUEUECTL_MAX_BACKOFF_SECONDS", "3600"))
 
 def utcnow_iso_z():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -22,16 +39,16 @@ def utcnow_iso_z():
 def get_max_retries():
     v = r.hget(CONFIG_HASH, "max-retries")
     try:
-        return int(v) if v is not None else 3
+        return int(v) if v is not None else int(os.getenv("QUEUECTL_DEFAULT_MAX_RETRIES", "3"))
     except Exception:
-        return 3
+        return int(os.getenv("QUEUECTL_DEFAULT_MAX_RETRIES", "3"))
 
 def get_backoff_base():
     v = r.hget(CONFIG_HASH, "backoff_base")
     try:
-        return int(v) if v is not None else 2
+        return int(v) if v is not None else int(os.getenv("QUEUECTL_DEFAULT_BACKOFF_BASE", "2"))
     except Exception:
-        return 2
+        return int(os.getenv("QUEUECTL_DEFAULT_BACKOFF_BASE", "2"))
 
 def execute(job):
     try:
@@ -44,7 +61,6 @@ def execute(job):
         return False
 
 def mark_processing_replace(raw, job):
-    """Replace the raw entry in PROCESSING with updated job JSON."""
     try:
         r.lrem(PROCESSING, 1, raw)
         r.lpush(PROCESSING, json.dumps(job))
@@ -70,12 +86,14 @@ def push_to_dead(job):
     logger.info("Pushed to DLQ %s", job.get("id"))
 
 def schedule_delayed(job, delay_seconds):
+    if delay_seconds > MAX_BACKOFF_SECONDS:
+        delay_seconds = MAX_BACKOFF_SECONDS
     available_at = time.time() + delay_seconds
     job["state"] = "delayed"
     job["updated_at"] = utcnow_iso_z()
     member = json.dumps(job)
     r.zadd(DELAYED, {member: available_at})
-    logger.info("Scheduled delayed job %s for in %s sec", job.get("id"), delay_seconds)
+    logger.info("Scheduled delayed job %s for %s sec (at %s)", job.get("id"), delay_seconds, available_at)
 
 def requeue_immediate(job):
     job["state"] = "pending"
@@ -93,7 +111,7 @@ if __name__ == "__main__":
         try:
             job = json.loads(raw)
         except Exception:
-            logger.exception("Bad job payload, sending to DLQ raw")
+            logger.exception("Bad payload; moving raw to DLQ")
             r.lrem(PROCESSING, 1, raw)
             r.lpush(DEAD, raw)
             continue

@@ -1,29 +1,56 @@
-# daemon/main.py
+import os
+import sys
+import json
+import time
+import threading
+import logging
+import subprocess
+from datetime import datetime, timezone
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import redis, subprocess, json, sys, logging, threading, time
-from typing import Optional
-from datetime import datetime, timezone
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+import redis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+REDIS_HOST = os.getenv("QUEUECTL_REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("QUEUECTL_REDIS_PORT", "6379"))
+REDIS_DECODE = os.getenv("QUEUECTL_REDIS_DECODE_RESPONSES", "true").lower() in ("1", "true", "yes")
+
+QUEUE = os.getenv("QUEUECTL_QUEUE_KEY", "jobs")
+PROCESSING = os.getenv("QUEUECTL_PROCESSING_KEY", "jobs:processing")
+COMPLETED = os.getenv("QUEUECTL_COMPLETED_KEY", "jobs:completed")
+FAILED = os.getenv("QUEUECTL_FAILED_KEY", "jobs:failed")
+DEAD = os.getenv("QUEUECTL_DEAD_KEY", "jobs:dlq")
+DELAYED = os.getenv("QUEUECTL_DELAYED_KEY", "jobs:delayed")
+IDS_SET = os.getenv("QUEUECTL_IDS_SET", "jobs:ids")
+CONFIG_HASH = os.getenv("QUEUECTL_CONFIG_HASH", "queuectl:config")
+
+DELAYED_BATCH = int(os.getenv("QUEUECTL_DELAYED_MOVER_BATCH", "100"))
+DELAYED_INTERVAL = float(os.getenv("QUEUECTL_DELAYED_MOVER_INTERVAL", "1.0"))
+
+DEFAULT_MAX_RETRIES = int(os.getenv("QUEUECTL_DEFAULT_MAX_RETRIES", "3"))
+DEFAULT_BACKOFF_BASE = int(os.getenv("QUEUECTL_DEFAULT_BACKOFF_BASE", "2"))
+MAX_BACKOFF_SECONDS = int(os.getenv("QUEUECTL_MAX_BACKOFF_SECONDS", "3600"))
+
+WORKER_MODULE = os.getenv("QUEUECTL_WORKER_MODULE", "worker.worker")
+
+
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=REDIS_DECODE)
+
 app = FastAPI()
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-
-QUEUE = "jobs"
-PROCESSING = "jobs:processing"
-COMPLETED = "jobs:completed"
-FAILED = "jobs:failed"
-DEAD = "jobs:dlq"
-DELAYED = "jobs:delayed"
-CONFIG_HASH = "queuectl:config"
-WORKERS = {}  
-
-# Default config
-DEFAULT_CONFIG = {"max-retries": 3, "backoff_base": 2}
+WORKERS = {}
 
 # Ensure defaults
+DEFAULT_CONFIG = {"max-retries": DEFAULT_MAX_RETRIES, "backoff_base": DEFAULT_BACKOFF_BASE}
 for k, v in DEFAULT_CONFIG.items():
     if r.hget(CONFIG_HASH, k) is None:
         r.hset(CONFIG_HASH, k, v)
@@ -52,36 +79,35 @@ class JobModel(BaseModel):
 
 @app.on_event("startup")
 def start_background_tasks():
-    # Start the delayed mover thread
     t = threading.Thread(target=_delayed_mover, daemon=True)
     t.start()
     logger.info("Started delayed mover thread")
 
 def _delayed_mover():
-    
+    """
+    Move ready jobs from DELAYED zset to QUEUE (pending).
+    """
     while True:
         try:
             now = time.time()
-            ready = r.zrangebyscore(DELAYED, "-inf", now, start=0, num=100)
+            ready = r.zrangebyscore(DELAYED, "-inf", now, start=0, num=DELAYED_BATCH)
             for member in ready:
                 removed = r.zrem(DELAYED, member)
-                if removed:
-                    try:
-                        job = json.loads(member)
-                    except Exception:
-                       
-                        r.lpush(DEAD, member)
-                        continue
-                    job["state"] = "pending"
-                    job["updated_at"] = utcnow_iso_z()
-                    r.lpush(QUEUE, json.dumps(job))
-                    logger.info("Moved delayed job back to pending: %s", job.get("id"))
-            time.sleep(1.0)
+                if not removed:
+                    continue
+                try:
+                    job = json.loads(member)
+                except Exception:
+                    r.lpush(DEAD, member)
+                    continue
+                job["state"] = "pending"
+                job["updated_at"] = utcnow_iso_z()
+                r.lpush(QUEUE, json.dumps(job))
+                logger.info("Moved delayed job back to pending: %s", job.get("id"))
+            time.sleep(DELAYED_INTERVAL)
         except Exception:
-            logger.exception("Delayed mover encountered an error; retrying in 1s")
-            time.sleep(1.0)
-
-
+            logger.exception("Delayed mover error; sleeping %s", DELAYED_INTERVAL)
+            time.sleep(DELAYED_INTERVAL)
 _ENQUEUE_LUA = """
 -- KEYS[1] = ids set
 -- KEYS[2] = queue list
@@ -109,10 +135,9 @@ def enqueue(job: JobModel):
     job_id = j["id"]
 
     try:
-       
-        res = r.eval(_ENQUEUE_LUA, 2, "jobs:ids", QUEUE, job_id, job_json)
+        res = r.eval(_ENQUEUE_LUA, 2, IDS_SET, QUEUE, job_id, job_json)
     except Exception:
-        logger.exception("Redis error while enqueueing")
+        logger.exception("Redis Lua enqueue failed")
         raise HTTPException(status_code=500, detail="redis error")
 
     if res == 0:
@@ -125,11 +150,11 @@ def worker_start(payload: dict):
     pids = []
     for _ in range(count):
         try:
-            cmd = [sys.executable, "-m", "worker.worker"]
+            cmd = [sys.executable, "-m", WORKER_MODULE]
             p = subprocess.Popen(cmd)
             WORKERS[p.pid] = p
             pids.append(p.pid)
-            logger.info("Started worker pid=%s cmd=%s", p.pid, cmd)
+            logger.info("Started worker pid=%s", p.pid)
         except Exception:
             logger.exception("Failed to start worker")
     return {"started": pids}
@@ -142,7 +167,6 @@ def worker_stop(payload: dict):
             p.terminate()
             killed.append(pid)
             WORKERS.pop(pid, None)
-            logger.info("Terminated worker pid=%s", pid)
         except Exception:
             logger.exception("Failed to terminate pid=%s", pid)
     return {"stopped": killed}
@@ -168,22 +192,20 @@ def status():
         "workers": list(WORKERS.keys())
     }
 
-
 @app.get("/list")
 def list_jobs(state: str = "pending"):
-    state = state.lower()
-    if state == "pending":
+    s = state.lower()
+    if s == "pending":
         items = r.lrange(QUEUE, 0, -1)
-    elif state == "processing":
+    elif s == "processing":
         items = r.lrange(PROCESSING, 0, -1)
-    elif state == "completed":
+    elif s == "completed":
         items = r.lrange(COMPLETED, 0, -1)
-    elif state == "failed":
+    elif s == "failed":
         items = r.lrange(FAILED, 0, -1)
-    elif state == "dead":
+    elif s == "dead":
         items = r.lrange(DEAD, 0, -1)
-    elif state == "delayed":
-        
+    elif s == "delayed":
         items = r.zrange(DELAYED, 0, -1, withscores=True)
         out = []
         for member, score in items:
@@ -191,16 +213,17 @@ def list_jobs(state: str = "pending"):
                 out.append({"job": json.loads(member), "available_at": score})
             except Exception:
                 out.append({"raw": member, "available_at": score})
-        return {"state": state, "count": len(out), "jobs": out}
+        return {"state": s, "count": len(out), "jobs": out}
     else:
         raise HTTPException(status_code=400, detail=f"unsupported state: {state}")
+
     out = []
-    for s in items:
+    for it in items:
         try:
-            out.append(json.loads(s))
+            out.append(json.loads(it))
         except Exception:
-            out.append({"raw": s})
-    return {"state": state, "count": len(out), "jobs": out}
+            out.append({"raw": it})
+    return {"state": s, "count": len(out), "jobs": out}
 
 @app.get("/dlq/list")
 def dlq_list():
