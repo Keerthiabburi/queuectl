@@ -5,8 +5,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+
 QUEUE = "jobs"
-DLQ = "jobs:dlq"
+PROCESSING = "jobs:processing"
+COMPLETED = "jobs:completed"
+FAILED = "jobs:failed"
+DEAD = "jobs:dlq"
 CONFIG_HASH = "queuectl:config"
 
 def get_max_retries():
@@ -26,9 +30,17 @@ def execute(job):
         logger.exception("Job failed %s: %s", job.get("id"), e)
         return False
 
-def push_to_dlq(job):
-    logger.info("Pushing job to DLQ %s", job.get("id"))
-    r.lpush(DLQ, json.dumps(job))
+def push_to_dead(job):
+    logger.info("Pushing job to DEAD/DLQ %s", job.get("id"))
+    r.lpush(DEAD, json.dumps(job))
+
+def record_failed(job):
+    logger.info("Recording failed job %s attempts=%s", job.get("id"), job.get("attempts"))
+    r.lpush(FAILED, json.dumps(job))
+
+def mark_completed(job):
+    logger.info("Marking job completed %s", job.get("id"))
+    r.lpush(COMPLETED, json.dumps(job))
 
 def requeue_job(job):
     logger.info("Requeueing job %s attempts=%s", job.get("id"), job.get("attempts"))
@@ -36,30 +48,39 @@ def requeue_job(job):
 
 if __name__ == "__main__":
     while True:
-        res = r.brpop(QUEUE, timeout=5)
+        res = r.brpoplpush(QUEUE, PROCESSING, timeout=5)
         if not res:
             time.sleep(0.5)
             continue
-        _, data = res
+        raw = res
         try:
-            job = json.loads(data)
+            job = json.loads(raw)
         except Exception:
             logger.exception("Bad job payload, sending to DLQ raw")
-            r.lpush(DLQ, data)
+            # remove from processing (best effort) and push raw to DLQ
+            r.lrem(PROCESSING, 1, raw)
+            r.lpush(DEAD, raw)
             continue
 
-        # ensure attempts field
         attempts = int(job.get("attempts", 0))
         job["attempts"] = attempts
 
         ok = execute(job)
+        
+        r.lrem(PROCESSING, 1, raw)
+
         if ok:
+            mark_completed(job)
             continue
-        # failed -> check retries
+
+        # failure handling
         max_retries = get_max_retries()
         job["attempts"] = attempts + 1
+
         if job["attempts"] <= max_retries:
-            # backoff: simple immediate requeue (could add delay)
+            # record as failed (retryable) and requeue
+            record_failed(job)
             requeue_job(job)
         else:
-            push_to_dlq(job)
+            # exceeded retries -> send to dead-letter queue
+            push_to_dead(job)

@@ -11,29 +11,30 @@ app = FastAPI()
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
 QUEUE = "jobs"
-DLQ = "jobs:dlq"
+PROCESSING = "jobs:processing"
+COMPLETED = "jobs:completed"
+FAILED = "jobs:failed"
+DEAD = "jobs:dlq"
 CONFIG_HASH = "queuectl:config"
 WORKERS = {}  
 
 # Default config
 DEFAULT_CONFIG = {"max-retries": 3}
 
-def get_config(key: str, default=None):
-    v = r.hget(CONFIG_HASH, key)
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return v
-
-def set_config(key: str, value):
-    r.hset(CONFIG_HASH, key, value)
-
 # Ensure defaults
 for k, v in DEFAULT_CONFIG.items():
     if r.hget(CONFIG_HASH, k) is None:
         r.hset(CONFIG_HASH, k, v)
+
+def get_config_int(key: str, default: int):
+    v = r.hget(CONFIG_HASH, key)
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
+
+def set_config(key: str, value: str):
+    r.hset(CONFIG_HASH, key, value)
 
 class JobModel(BaseModel):
     id: str
@@ -42,7 +43,9 @@ class JobModel(BaseModel):
 
 @app.post("/enqueue")
 def enqueue(job: JobModel):
-    job_json = json.dumps(job.dict())
+    j = job.dict()
+    j.setdefault("attempts", 0)
+    job_json = json.dumps(j)
     r.lpush(QUEUE, job_json)
     return {"status": "ok", "id": job.id}
 
@@ -78,25 +81,37 @@ def worker_stop(payload: dict):
 def status():
     try:
         qlen = r.llen(QUEUE)
-        dlq_len = r.llen(DLQ)
+        proc_len = r.llen(PROCESSING)
+        completed_len = r.llen(COMPLETED)
+        failed_len = r.llen(FAILED)
+        dlq_len = r.llen(DEAD)
     except Exception:
-        qlen = dlq_len = None
-    return {"queue": qlen, "dlq": dlq_len, "workers": list(WORKERS.keys())}
+        qlen = proc_len = completed_len = failed_len = dlq_len = None
+    return {
+        "queue_pending": qlen,
+        "processing": proc_len,
+        "completed": completed_len,
+        "failed": failed_len,
+        "dead": dlq_len,
+        "workers": list(WORKERS.keys())
+    }
 
 
 @app.get("/list")
 def list_jobs(state: str = "pending"):
-    """
-    state: pending | dlq
-    pending -> jobs in main queue
-    dlq -> dead-letter queue
-    """
+    state = state.lower()
     if state == "pending":
         items = r.lrange(QUEUE, 0, -1)
-    elif state == "dlq":
-        items = r.lrange(DLQ, 0, -1)
+    elif state == "processing":
+        items = r.lrange(PROCESSING, 0, -1)
+    elif state == "completed":
+        items = r.lrange(COMPLETED, 0, -1)
+    elif state == "failed":
+        items = r.lrange(FAILED, 0, -1)
+    elif state == "dead":
+        items = r.lrange(DEAD, 0, -1)
     else:
-        raise HTTPException(status_code=400, detail="unsupported state")
+        raise HTTPException(status_code=400, detail=f"unsupported state: {state}")
     out = []
     for s in items:
         try:
@@ -107,7 +122,7 @@ def list_jobs(state: str = "pending"):
 
 @app.get("/dlq/list")
 def dlq_list():
-    items = r.lrange(DLQ, 0, -1)
+    items = r.lrange(DEAD, 0, -1)
     jobs = []
     for s in items:
         try:
@@ -118,10 +133,7 @@ def dlq_list():
 
 @app.post("/dlq/retry/{job_id}")
 def dlq_retry(job_id: str):
-    """
-    Find the first job in DLQ with id == job_id, remove it from DLQ and push back to main queue.
-    """
-    items = r.lrange(DLQ, 0, -1)
+    items = r.lrange(DEAD, 0, -1)
     target = None
     for s in items:
         try:
@@ -133,11 +145,10 @@ def dlq_retry(job_id: str):
             break
     if not target:
         raise HTTPException(status_code=404, detail="job not found in DLQ")
-    # remove first occurrence and push back to queue (reset attempts or keep attempts)
-    r.lrem(DLQ, 1, target)
-    # optionally reset attempts to 0 when retrying from DLQ
+    r.lrem(DEAD, 1, target)
     j = json.loads(target)
     j["attempts"] = j.get("attempts", 0)
+    # push back to pending (reset attempts optionally)
     r.lpush(QUEUE, json.dumps(j))
     return {"status": "retried", "id": job_id}
 
