@@ -1,13 +1,13 @@
+# daemon/main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import redis, os, subprocess, json, sys, logging
-from typing import List, Optional
+import redis, os, subprocess, json, sys, logging, threading, time
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
 QUEUE = "jobs"
@@ -15,11 +15,12 @@ PROCESSING = "jobs:processing"
 COMPLETED = "jobs:completed"
 FAILED = "jobs:failed"
 DEAD = "jobs:dlq"
+DELAYED = "jobs:delayed"
 CONFIG_HASH = "queuectl:config"
 WORKERS = {}  
 
 # Default config
-DEFAULT_CONFIG = {"max-retries": 3}
+DEFAULT_CONFIG = {"max-retries": 3, "backoff_base": 2}
 
 # Ensure defaults
 for k, v in DEFAULT_CONFIG.items():
@@ -40,6 +41,39 @@ class JobModel(BaseModel):
     id: str
     command: str
     attempts: Optional[int] = 0
+
+@app.on_event("startup")
+def start_background_tasks():
+    # Start the delayed mover thread
+    t = threading.Thread(target=_delayed_mover, daemon=True)
+    t.start()
+    logger.info("Started delayed mover thread")
+
+def _delayed_mover():
+    
+    while True:
+        try:
+            now = time.time()
+            
+            ready = r.zrangebyscore(DELAYED, "-inf", now, start=0, num=100)
+            if ready:
+                for member in ready:
+                    
+                    with r.pipeline() as pipe:
+                        pipe.multi()
+                        pipe.zrem(DELAYED, member)
+                        pipe.execute()
+                        
+                    removed = r.zrem(DELAYED, member) 
+                    if removed:
+                        
+                        r.lpush(QUEUE, member)
+                        logger.info("Moved delayed job back to pending: %s", member)
+            
+            time.sleep(1.0)
+        except Exception:
+            logger.exception("Delayed mover encountered an error; retrying in 1s")
+            time.sleep(1.0)
 
 @app.post("/enqueue")
 def enqueue(job: JobModel):
@@ -85,14 +119,16 @@ def status():
         completed_len = r.llen(COMPLETED)
         failed_len = r.llen(FAILED)
         dlq_len = r.llen(DEAD)
+        delayed_len = r.zcard(DELAYED)
     except Exception:
-        qlen = proc_len = completed_len = failed_len = dlq_len = None
+        qlen = proc_len = completed_len = failed_len = dlq_len = delayed_len = None
     return {
         "queue_pending": qlen,
         "processing": proc_len,
         "completed": completed_len,
         "failed": failed_len,
         "dead": dlq_len,
+        "delayed": delayed_len,
         "workers": list(WORKERS.keys())
     }
 
@@ -110,6 +146,16 @@ def list_jobs(state: str = "pending"):
         items = r.lrange(FAILED, 0, -1)
     elif state == "dead":
         items = r.lrange(DEAD, 0, -1)
+    elif state == "delayed":
+        
+        items = r.zrange(DELAYED, 0, -1, withscores=True)
+        out = []
+        for member, score in items:
+            try:
+                out.append({"job": json.loads(member), "available_at": score})
+            except Exception:
+                out.append({"raw": member, "available_at": score})
+        return {"state": state, "count": len(out), "jobs": out}
     else:
         raise HTTPException(status_code=400, detail=f"unsupported state: {state}")
     out = []
@@ -148,7 +194,6 @@ def dlq_retry(job_id: str):
     r.lrem(DEAD, 1, target)
     j = json.loads(target)
     j["attempts"] = j.get("attempts", 0)
-    # push back to pending (reset attempts optionally)
     r.lpush(QUEUE, json.dumps(j))
     return {"status": "retried", "id": job_id}
 
