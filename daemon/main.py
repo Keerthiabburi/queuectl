@@ -81,6 +81,20 @@ def _delayed_mover():
             logger.exception("Delayed mover encountered an error; retrying in 1s")
             time.sleep(1.0)
 
+
+_ENQUEUE_LUA = """
+-- KEYS[1] = ids set
+-- KEYS[2] = queue list
+-- ARGV[1] = job_id
+-- ARGV[2] = job_json
+local added = redis.call('SADD', KEYS[1], ARGV[1])
+if added == 0 then
+  return 0
+end
+redis.call('LPUSH', KEYS[2], ARGV[2])
+return 1
+"""
+
 @app.post("/enqueue")
 def enqueue(job: JobModel):
     now = utcnow_iso_z()
@@ -92,8 +106,18 @@ def enqueue(job: JobModel):
     j.setdefault("created_at", now)
     j["updated_at"] = now
     job_json = json.dumps(j)
-    r.lpush(QUEUE, job_json)
-    return {"status": "ok", "id": j["id"]}
+    job_id = j["id"]
+
+    try:
+       
+        res = r.eval(_ENQUEUE_LUA, 2, "jobs:ids", QUEUE, job_id, job_json)
+    except Exception:
+        logger.exception("Redis error while enqueueing")
+        raise HTTPException(status_code=500, detail="redis error")
+
+    if res == 0:
+        raise HTTPException(status_code=409, detail=f"job id '{job_id}' already exists")
+    return {"status": "ok", "id": job_id}
 
 @app.post("/worker/start")
 def worker_start(payload: dict):
